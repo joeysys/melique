@@ -15,3 +15,7 @@ A local music player built for triage — swipe the cover to mark, keep, or dele
 ./gradlew :app:assembleDebug :app:testDebugUnitTest
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
+
+## License
+
+GPL-3.0. See [LICENSE](LICENSE).
