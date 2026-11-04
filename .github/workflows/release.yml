@@ -1,0 +1,49 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Decode keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+        run: echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/melique.jks"
+
+      - name: Write keystore.properties
+        env:
+          STORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          {
+            echo "storeFile=${{ runner.temp }}/melique.jks"
+            printf 'storePassword=%s\n' "$STORE_PASSWORD"
+            echo "keyAlias=melique"
+            printf 'keyPassword=%s\n' "$KEY_PASSWORD"
+          } > keystore.properties
+
+      - run: ./gradlew :app:assembleRelease
+
+      - name: Rename apk
+        run: |
+          cd app/build/outputs/apk/release
+          mv app-release.apk "Melique-${GITHUB_REF_NAME#v}.apk"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: app/build/outputs/apk/release/*.apk
