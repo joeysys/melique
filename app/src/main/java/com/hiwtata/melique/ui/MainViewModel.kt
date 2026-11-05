@@ -2,8 +2,11 @@ package com.hiwtata.melique.ui
 
 import android.app.Application
 import android.content.IntentSender
+import android.database.ContentObserver
 import android.net.Uri
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.provider.MediaStore
 import androidx.lifecycle.AndroidViewModel
@@ -88,6 +91,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     private var pendingSystem: PendingSystemDelete? = null
     private var sessionRestored = false
+    private var libraryObserver: ContentObserver? = null
     private var libraryRefreshJob: Job? = null
     private var scanGeneration = 0
     private var lastScanStartedElapsed = 0L
@@ -107,6 +111,14 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 scheduleLibraryRefresh()
             }
         }
+    }
+
+    override fun onCleared() {
+        libraryRefreshJob?.cancel()
+        libraryObserver?.let { observer ->
+            getApplication<Application>().contentResolver.unregisterContentObserver(observer)
+        }
+        super.onCleared()
     }
 
     fun albums(): List<AlbumGroup> = _library.value.toAlbums(getApplication())
@@ -154,10 +166,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         val context = getApplication<Application>()
         val undo = Access.canUndoDelete(context)
         val audio = Access.hasAudio(context)
-        val changed = audio != _audioGranted.value || undo != _canUndo.value
         _canUndo.value = undo
         _audioGranted.value = audio
-        if (audio && (changed || _library.value.isEmpty())) refresh()
+        if (!audio) return
+        ensureLibraryObserver()
+        if (_library.value.isEmpty()) refresh() else scheduleLibraryRefresh()
     }
 
     fun refresh() {
@@ -398,6 +411,34 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             pendingSystem = null
             tell(text(R.string.cannot_start_system_delete))
         }
+    }
+
+    private fun ensureLibraryObserver() {
+        if (libraryObserver != null) return
+        val observer = object : ContentObserver(Handler(Looper.getMainLooper())) {
+            override fun onChange(selfChange: Boolean) {
+                scheduleLibraryRefresh()
+            }
+        }
+        val resolver = getApplication<Application>().contentResolver
+        val uris = buildSet {
+            add(Uri.parse("content://media"))
+            add(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                runCatching {
+                    MediaStore.getExternalVolumeNames(getApplication()).forEach { volume ->
+                        add(MediaStore.Audio.Media.getContentUri(volume))
+                    }
+                }
+            }
+        }
+        var registered = false
+        uris.forEach { uri ->
+            if (runCatching { resolver.registerContentObserver(uri, true, observer) }.isSuccess) {
+                registered = true
+            }
+        }
+        if (registered) libraryObserver = observer
     }
 
     private fun scheduleLibraryRefresh() {
