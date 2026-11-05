@@ -121,7 +121,6 @@ fun PlayerPane(
     val index by vm.queueIndex.collectAsStateWithLifecycle()
     val playing by vm.isPlaying.collectAsStateWithLifecycle()
     val marks by vm.marks.collectAsStateWithLifecycle()
-    val busy by vm.busy.collectAsStateWithLifecycle()
     val selecting by vm.selecting.collectAsStateWithLifecycle()
     val shuffleOn by vm.shuffleEnabled.collectAsStateWithLifecycle()
     val repeatMode by vm.repeatMode.collectAsStateWithLifecycle()
@@ -319,7 +318,7 @@ fun PlayerPane(
                                 .clip(RoundedCornerShape(8.dp))
                                 .background(Color(0xFF161616))
                                 .coverDrag(
-                                    enabled = !gestureLocked && !busy && !motionBusy,
+                                    enabled = !gestureLocked && !motionBusy,
                                     onMove = { drag ->
                                         gestureHint = gestureCaption(
                                             context,

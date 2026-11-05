@@ -4,6 +4,7 @@ import android.app.Application
 import android.content.IntentSender
 import android.net.Uri
 import android.os.Build
+import android.os.SystemClock
 import android.provider.MediaStore
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -19,11 +20,14 @@ import com.hiwtata.melique.data.PlaySnap
 import com.hiwtata.melique.data.QueueBuilder
 import com.hiwtata.melique.data.QueueMode
 import com.hiwtata.melique.data.Song
+import com.hiwtata.melique.data.keepingLivePlayback
 import com.hiwtata.melique.data.removing
 import com.hiwtata.melique.data.toAlbums
 import androidx.media3.common.Player
 import com.hiwtata.melique.player.PlaybackEngine
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -44,9 +48,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     private val _scanning = MutableStateFlow(false)
     val scanning: StateFlow<Boolean> = _scanning.asStateFlow()
-
-    private val _busy = MutableStateFlow(false)
-    val busy: StateFlow<Boolean> = _busy.asStateFlow()
 
     private val _audioGranted = MutableStateFlow(false)
     val audioGranted: StateFlow<Boolean> = _audioGranted.asStateFlow()
@@ -87,11 +88,24 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     private var pendingSystem: PendingSystemDelete? = null
     private var sessionRestored = false
+    private var libraryRefreshJob: Job? = null
+    private var scanGeneration = 0
+    private var lastScanStartedElapsed = 0L
+    private val deleteRollbacks = ArrayDeque<DeleteRollback>()
 
     init {
         refreshAccess()
         viewModelScope.launch {
             engine.events.collect { tell(it) }
+        }
+        viewModelScope.launch {
+            musicApp.trash.failures.collect { failure ->
+                bumpScan()
+                _library.update { current -> (current + failure.songs).distinctBy { it.key } }
+                restoreAfterFailedDelete(failure)
+                tell(failure.message)
+                scheduleLibraryRefresh()
+            }
         }
     }
 
@@ -118,7 +132,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun cover(action: CoverAction) {
-        if (_gestureLocked.value || _busy.value) return
+        if (_gestureLocked.value) return
         when (action) {
             CoverAction.Ignore -> Unit
             CoverAction.ToggleMode -> toggleSelecting()
@@ -266,7 +280,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun decide(decision: Decision) {
-        if (_busy.value) return
         val song = engine.currentSong() ?: return
         when (decision) {
             Decision.DeleteSong -> delete(listOf(song), text(R.string.deleted_named, song.title))
@@ -283,20 +296,15 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun undo() {
-        if (_busy.value) return
-        val batch = musicApp.trash.takeLatest() ?: return
         viewModelScope.launch {
-            _busy.value = true
-            val restored = withContext(Dispatchers.IO) { musicApp.trash.restoreFiles(batch) }
-            _busy.value = false
+            val restored = musicApp.trash.undoLatest() ?: return@launch
             restored.onSuccess { songs ->
+                bumpScan()
                 engine.insertAfterCurrent(songs)
                 _library.update { current -> (current + songs).distinctBy { it.key } }
                 tell(text(R.string.undone))
-                delay(700)
-                scan(showSpinner = false)
+                scheduleLibraryRefresh()
             }.onFailure { error ->
-                musicApp.trash.arm(batch)
                 tell(error.message ?: text(R.string.undo_failed))
             }
         }
@@ -333,7 +341,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         if (distinct.isEmpty()) return
         val context = getApplication<Application>()
         if (Access.canUndoDelete(context)) {
-            viewModelScope.launch { silentDelete(distinct, label) }
+            silentDelete(distinct, label)
         } else if (Build.VERSION.SDK_INT >= 30) {
             requestSystemDelete(distinct, label)
         } else {
@@ -341,23 +349,39 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    private suspend fun silentDelete(songs: List<Song>, label: String) {
+    private fun silentDelete(songs: List<Song>, label: String) {
+        val token = musicApp.trash.stageDelete(songs, label).getOrElse { error ->
+            tell(error.message ?: text(R.string.delete_failed))
+            return
+        }
+        bumpScan()
+        val keys = songs.map { it.key }.toSet()
         val snap = engine.capture()
-        val next = snap.removing(songs.map { it.key }.toSet())
+        val next = snap.removing(keys)
+        rememberDeleteRollback(token, snap, next)
         engine.releaseFileHandles()
         engine.restore(next)
-        _busy.value = true
-        val moved = withContext(Dispatchers.IO) { musicApp.trash.moveToTrash(songs, label) }
-        _busy.value = false
-        moved.onSuccess { batch ->
-            musicApp.trash.arm(batch)
-            val keys = songs.map { it.key }.toSet()
-            _library.update { current -> current.filter { it.key !in keys } }
-            delay(600)
-            scan(showSpinner = false)
-        }.onFailure { error ->
-            engine.restore(snap)
-            tell(error.message ?: text(R.string.delete_failed))
+        _library.update { current -> current.filter { it.key !in keys } }
+        musicApp.trash.startDelete(token)
+    }
+
+    private fun rememberDeleteRollback(token: Long, snap: PlaySnap, next: PlaySnap) {
+        deleteRollbacks.addLast(DeleteRollback(token, snap, next))
+        while (deleteRollbacks.size > 8) deleteRollbacks.removeFirst()
+    }
+
+    private fun restoreAfterFailedDelete(failure: com.hiwtata.melique.data.TrashFailure) {
+        val rollback = deleteRollbacks.find { it.token == failure.token }
+        deleteRollbacks.removeAll { it.token == failure.token }
+        if (
+            rollback != null &&
+            engine.index.value == rollback.next.index &&
+            engine.queue.value.map { it.key } == rollback.next.songs.map { it.key }
+        ) {
+            val live = engine.capture()
+            engine.restore(rollback.snap.keepingLivePlayback(live))
+        } else {
+            engine.insertAfterCurrent(failure.songs)
         }
     }
 
@@ -376,20 +400,43 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    private fun scheduleLibraryRefresh() {
+        if (!_audioGranted.value) return
+        libraryRefreshJob?.cancel()
+        libraryRefreshJob = viewModelScope.launch {
+            val since = SystemClock.elapsedRealtime() - lastScanStartedElapsed
+            delay(maxOf(REFRESH_QUIET_MS, REFRESH_MIN_GAP_MS - since))
+            scan(showSpinner = false)
+        }
+    }
+
+    private fun bumpScan() {
+        scanGeneration += 1
+    }
+
     private suspend fun scan(showSpinner: Boolean) {
         if (!_audioGranted.value) return
+        val generation = ++scanGeneration
+        lastScanStartedElapsed = SystemClock.elapsedRealtime()
         if (showSpinner) _scanning.value = true
         val trustPaths = Access.canUndoDelete(getApplication())
         val songs = try {
             withContext(Dispatchers.IO) { musicApp.repository.scan(trustPaths) }
+        } catch (error: CancellationException) {
+            throw error
         } catch (error: Exception) {
-            _scanning.value = false
-            tell(error.message ?: text(R.string.library_read_failed))
+            if (generation == scanGeneration) {
+                _scanning.value = false
+                tell(error.message ?: text(R.string.library_read_failed))
+            }
             return
         }
-        _library.value = songs
+        if (generation != scanGeneration) return
+        val hidden = musicApp.trash.inflightKeys()
+        val visible = if (hidden.isEmpty()) songs else songs.filter { it.key !in hidden }
+        _library.value = visible
         _scanning.value = false
-        restoreSession(songs)
+        restoreSession(visible)
     }
 
     private fun restoreSession(songs: List<Song>) {
@@ -527,6 +574,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private data class PendingSystemDelete(val keys: Set<String>, val label: String)
+
+    private data class DeleteRollback(val token: Long, val snap: PlaySnap, val next: PlaySnap)
+
+    private companion object {
+        const val REFRESH_QUIET_MS = 400L
+        const val REFRESH_MIN_GAP_MS = 1_000L
+    }
 }
 
 data class DeleteGesture(

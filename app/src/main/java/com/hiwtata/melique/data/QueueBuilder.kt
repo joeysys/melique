@@ -51,3 +51,19 @@ fun PlaySnap.removing(keys: Set<String>): PlaySnap {
     val newIndex = filtered.indexOfFirst { it.key == next.key }.coerceAtLeast(0)
     return copy(songs = filtered, index = newIndex, positionMs = 0L, playWhenReady = true)
 }
+
+/**
+ * Put [live] playback onto this pre-delete queue.
+ * An empty live queue keeps this snapshot. Otherwise the index follows the song
+ * that is actually playing, and the live position and play/pause state are kept.
+ */
+fun PlaySnap.keepingLivePlayback(live: PlaySnap): PlaySnap {
+    if (live.songs.isEmpty()) return this
+    val currentKey = live.songs.getOrNull(live.index)?.key
+    val located = songs.indexOfFirst { it.key == currentKey }
+    return copy(
+        index = if (located >= 0) located else index,
+        positionMs = live.positionMs,
+        playWhenReady = live.playWhenReady,
+    )
+}

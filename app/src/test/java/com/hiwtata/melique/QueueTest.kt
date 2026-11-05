@@ -5,6 +5,7 @@ import com.hiwtata.melique.data.PlaySnap
 import com.hiwtata.melique.data.QueueBuilder
 import com.hiwtata.melique.data.QueueMode
 import com.hiwtata.melique.data.Song
+import com.hiwtata.melique.data.keepingLivePlayback
 import com.hiwtata.melique.data.removing
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -66,6 +67,65 @@ class QueueTest {
         assertEquals("c", next.songs[next.index].key)
         assertEquals(8_000L, next.positionMs)
         assertTrue(next.playWhenReady)
+    }
+
+    @Test
+    fun keepingLivePlaybackFollowsTheSongThatIsActuallyPlaying() {
+        val original = PlaySnap(
+            songs = listOf(song("a"), song("d"), song("n"), song("c")),
+            index = 1,
+            positionMs = 9_000,
+            playWhenReady = true,
+            title = "Queue",
+        )
+        val live = PlaySnap(
+            songs = listOf(song("a"), song("n"), song("c")),
+            index = 1,
+            positionMs = 4_500,
+            playWhenReady = false,
+            title = "Queue",
+        )
+        val restored = original.keepingLivePlayback(live)
+        assertEquals(listOf("a", "d", "n", "c"), restored.songs.map { it.key })
+        assertEquals(2, restored.index)
+        assertEquals(4_500L, restored.positionMs)
+        assertEquals(false, restored.playWhenReady)
+    }
+
+    @Test
+    fun keepingLivePlaybackKeepsTheSnapshotWhenTheLiveQueueIsEmpty() {
+        val original = PlaySnap(
+            songs = listOf(song("a"), song("b")),
+            index = 1,
+            positionMs = 3_000,
+            playWhenReady = true,
+            title = "Queue",
+        )
+        val live = PlaySnap(emptyList(), index = 0, positionMs = 0L, playWhenReady = false, title = "Queue")
+        val restored = original.keepingLivePlayback(live)
+        assertEquals(original, restored)
+    }
+
+    @Test
+    fun keepingLivePlaybackFallsBackToTheSnapshotIndexWhenTheSongIsGone() {
+        val original = PlaySnap(
+            songs = listOf(song("a"), song("b")),
+            index = 0,
+            positionMs = 1_000,
+            playWhenReady = true,
+            title = "Queue",
+        )
+        val live = PlaySnap(
+            songs = listOf(song("z")),
+            index = 0,
+            positionMs = 2_200,
+            playWhenReady = false,
+            title = "Queue",
+        )
+        val restored = original.keepingLivePlayback(live)
+        assertEquals(0, restored.index)
+        assertEquals(2_200L, restored.positionMs)
+        assertEquals(false, restored.playWhenReady)
     }
 
     private fun song(key: String, albumKey: String = key, track: Int = 1) = Song(
