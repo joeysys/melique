@@ -68,9 +68,11 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.composed
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import com.hiwtata.melique.R
@@ -91,6 +93,9 @@ import androidx.compose.ui.graphics.graphicsLayer
 
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChange
+import androidx.compose.ui.input.pointer.util.VelocityTracker
+import androidx.compose.ui.input.pointer.util.addPointerInputChange
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.font.FontWeight
@@ -103,6 +108,9 @@ import androidx.media3.common.Player
 import com.hiwtata.melique.data.Disposition
 import com.hiwtata.melique.data.Song
 import com.hiwtata.melique.player.formatSleepRemaining
+import kotlin.math.abs
+import kotlin.math.hypot
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import com.hiwtata.melique.ui.theme.Faint
@@ -171,6 +179,7 @@ fun PlayerPane(
         }
     }
     val accent = visual?.accent ?: Color(0xFF8A7564)
+    val queueThreshold = with(androidx.compose.ui.platform.LocalDensity.current) { 72.dp.toPx() }
     Box(
         modifier
             .fillMaxSize()
@@ -179,6 +188,24 @@ fun PlayerPane(
             }
             .graphicsLayer { translationY = playerShift }
             .consumeTouches()
+            .queueReveal(
+                enabled = !gestureLocked && !motionBusy && !queueReady,
+                onMove = { dy ->
+                    queueShift = (rootHeight + dy).coerceIn(0f, rootHeight)
+                    queueShown = true
+                },
+                onSettle = { dy, vy ->
+                    val from = (rootHeight + dy).coerceIn(0f, rootHeight)
+                    scope.launch {
+                        motionBusy = true
+                        val open = shouldOpenQueue(dy, vy, queueThreshold)
+                        glide(from, if (open) 0f else rootHeight, vy) { queueShift = it }
+                        queueShown = open
+                        queueReady = open
+                        motionBusy = false
+                    }
+                },
+            )
             .background(accent.shade(0.45f)),
     ) {
         Backdrop(visual)
@@ -998,11 +1025,7 @@ private suspend fun followRelease(
                     glide(fromY, 0f, drag.vy, writeY)
                 }
                 drag.dy < 0f -> {
-                    val open = when {
-                        drag.vy <= -fling -> true
-                        drag.vy >= fling -> false
-                        else -> drag.dy <= -threshold
-                    }
+                    val open = shouldOpenQueue(drag.dy, drag.vy, threshold, fling)
                     glide(fromQueue, if (open) 0f else rootHeight, drag.vy, writeQueue)
                     onQueue(open)
                 }
@@ -1025,6 +1048,57 @@ private fun Color.shade(factor: Float): Color = Color(
 )
 
 private const val HINT_KEEP = "keep"
+
+private fun Modifier.queueReveal(
+    enabled: Boolean,
+    onMove: (dy: Float) -> Unit,
+    onSettle: (dy: Float, vy: Float) -> Unit,
+): Modifier = composed {
+    val enabledState = rememberUpdatedState(enabled)
+    val moveState = rememberUpdatedState(onMove)
+    val settleState = rememberUpdatedState(onSettle)
+    pointerInput(Unit) {
+        val slop = 16.dp.toPx()
+        coroutineScope {
+            while (true) {
+                val down = awaitPointerEventScope { awaitFirstDown(requireUnconsumed = true) }
+                if (!enabledState.value) {
+                    awaitPointerEventScope {
+                        while (true) {
+                            val event = awaitPointerEvent()
+                            if (event.changes.all { !it.pressed }) break
+                        }
+                    }
+                    continue
+                }
+                var total = Offset.Zero
+                var tracking = false
+                val tracker = VelocityTracker()
+                awaitPointerEventScope {
+                    tracker.addPointerInputChange(down)
+                    while (true) {
+                        val event = awaitPointerEvent()
+                        val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                        if (!change.pressed) break
+                        tracker.addPointerInputChange(change)
+                        total += change.positionChange()
+                        if (!tracking) {
+                            if (hypot(total.x.toDouble(), total.y.toDouble()) < slop) continue
+                            val upward = total.y < 0f && abs(total.y) > abs(total.x)
+                            if (!upward) break
+                            tracking = true
+                        }
+                        moveState.value(total.y)
+                        change.consume()
+                    }
+                }
+                if (tracking) {
+                    settleState.value(total.y, tracker.calculateVelocity().y)
+                }
+            }
+        }
+    }
+}
 
 private fun gestureCaption(
     context: android.content.Context,

@@ -58,3 +58,12 @@ fun interpretCover(
         CoverInput.Down -> CoverAction.Collapse
     }
 }
+
+/** Upward drag opens the queue. A downward fling cancels it. */
+fun shouldOpenQueue(dy: Float, vy: Float, threshold: Float, fling: Float = 1200f): Boolean {
+    return when {
+        vy <= -fling -> true
+        vy >= fling -> false
+        else -> dy <= -threshold
+    }
+}

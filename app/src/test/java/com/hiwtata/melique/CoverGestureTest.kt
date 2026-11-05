@@ -3,6 +3,9 @@ package com.hiwtata.melique
 import com.hiwtata.melique.ui.CoverAction
 import com.hiwtata.melique.ui.CoverInput
 import com.hiwtata.melique.ui.interpretCover
+import com.hiwtata.melique.ui.shouldOpenQueue
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Assert.assertEquals
 import org.junit.Test
 
@@ -37,5 +40,13 @@ class CoverGestureTest {
         assertEquals(CoverAction.Ignore, interpretCover(CoverInput.Up, selecting = true, confirming = true, kept = false))
         assertEquals(CoverAction.Ignore, interpretCover(CoverInput.Tap, selecting = true, confirming = true, kept = false))
         assertEquals(CoverAction.Ignore, interpretCover(CoverInput.LongPress, selecting = true, confirming = true, kept = false))
+    }
+
+    @Test
+    fun upwardDragOpensQueueAndDownwardFlingCancels() {
+        assertTrue(shouldOpenQueue(dy = -80f, vy = 0f, threshold = 72f))
+        assertFalse(shouldOpenQueue(dy = -20f, vy = 0f, threshold = 72f))
+        assertTrue(shouldOpenQueue(dy = -10f, vy = -1200f, threshold = 72f))
+        assertFalse(shouldOpenQueue(dy = -200f, vy = 1200f, threshold = 72f))
     }
 }
